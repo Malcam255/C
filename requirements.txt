@@ -1,0 +1,6 @@
+langchain_classic==1.0.1
+langchain_community==0.4.1
+langchain_core==1.2.7
+langchain_text_splitters==1.1.0
+streamlit
+
