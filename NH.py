@@ -1,5 +1,5 @@
-import os
 import streamlit as st
+import os
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -7,8 +7,9 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
-from langchain_community.llms import GPT4All
-from langchain_community.embeddings import HuggingFaceEmbeddings
+# ✅ CLOUD-COMPATIBLE replacements
+from langchain_community.llms import Ollama  # or HuggingFacePipeline
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 
@@ -19,57 +20,37 @@ from langchain_classic.chains.combine_documents import create_stuff_documents_ch
 # -----------------------------------------------------------------------------
 # STREAMLIT CONFIG
 # -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="NHIF RAG Chatbot",
-    page_icon="🤖",
-    layout="wide"
-)
+st.set_page_config(page_title="NHIF RAG Chatbot", page_icon="🤖", layout="wide")
 
 st.title("🤖 NHIF RAG Chatbot")
-st.caption("Ask questions strictly from NHIF documents")
+st.caption("Ask questions about NHIF services, coverage, benefits, and claims")
 
 # -----------------------------------------------------------------------------
-# PATHS (LINUX + UPSUN SAFE)
+# PATHS - CLOUD READY
 # -----------------------------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-DATA_DIR = os.path.join(BASE_DIR, "data")
-MODEL_DIR = os.path.join(BASE_DIR, "models")
-PERSIST_DIR = os.path.join(BASE_DIR, "nhif_chroma_db")
-
-PDF_PATH = os.path.join(DATA_DIR, "nhif.pdf")
-
-MODEL_NAME = "Llama-3.2-3B-Instruct-Q4_0.gguf"
-MODEL_PATH = os.path.join(MODEL_DIR, MODEL_NAME)
-
-os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(PERSIST_DIR, exist_ok=True)
+PDF_PATH = "nhif.pdf"  # Put PDF in repo root
+PERSIST_DIR = "./nhif_chroma_db"
 
 # -----------------------------------------------------------------------------
-# LOAD & CACHE RAG CHAIN
+# LOAD & CACHE EVERYTHING
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner=True)
 def load_rag_chain():
-
-    # ---- Load PDF ----
+    # Load PDF from repo
     loader = PyPDFLoader(PDF_PATH)
     documents = loader.load()
 
-    # ---- Split text ----
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=400,
-        chunk_overlap=100
-    )
-    chunks = splitter.split_documents(documents)
+    # Split text
+    splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=100)
+    texts = splitter.split_documents(documents)
 
-    # ---- Embeddings (Cloud & VPS safe) ----
+    # ✅ CLOUD EMBEDDINGS (no native binaries)
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
-    # ---- Vector DB ----
     vectorstore = Chroma.from_documents(
-        chunks,
+        texts,
         embeddings,
         persist_directory=PERSIST_DIR
     )
@@ -79,72 +60,51 @@ def load_rag_chain():
         search_kwargs={"score_threshold": 0.2, "k": 4}
     )
 
-    # ---- Download GPT4All model if missing ----
-    if not os.path.exists(MODEL_PATH):
-        from gpt4all import GPT4All
-        GPT4All.download_model(
-            MODEL_NAME,
-            model_path=MODEL_DIR
-        )
+    # ✅ CLOUD LLM - Use Ollama (free tier works)
+    llm = Ollama(model="llama3.2")  # Or "phi3", "gemma2"
 
-    # ---- LLM ----
-    llm = GPT4All(
-        model=MODEL_PATH,
-        n_threads=8
-    )
-
-    # ---- Question contextualizer ----
-    contextualize_prompt = ChatPromptTemplate.from_messages([
+    # Question contextualizer
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([
         (
             "system",
-            "Given chat history and the latest question, create a standalone question."
+            """Given a chat history and the latest user question,
+create a standalone question that incorporates context from the chat history."""
         ),
         MessagesPlaceholder("chat_history"),
         ("human", "{input}")
     ])
 
-    # ---- Answer prompt ----
+    # Answer prompt
     answer_prompt = ChatPromptTemplate.from_template("""
-You are an NHIF expert assistant.
-Use ONLY the context provided.
+You are an NHIF expert assistant. Use ONLY the context below.
 
 CONTEXT:
 {context}
 
-QUESTION:
-{input}
+QUESTION: {input}
 
 RULES:
-- Answer strictly from the NHIF context
-- If information is missing, say:
-  "I don't have that information in the NHIF documents."
+- Answer only from NHIF context
+- If missing, say: "I don't have that information in the NHIF documents."
 - Be concise and factual
 
 ANSWER:
 """)
 
     history_aware_retriever = create_history_aware_retriever(
-        llm,
-        retriever,
-        contextualize_prompt
+        llm, retriever, contextualize_q_prompt
     )
 
-    qa_chain = create_stuff_documents_chain(
-        llm,
-        answer_prompt
-    )
+    qa_chain = create_stuff_documents_chain(llm, answer_prompt)
 
-    rag_chain = create_retrieval_chain(
-        history_aware_retriever,
-        qa_chain
-    )
+    rag_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
 
     return rag_chain
 
 rag_chain = load_rag_chain()
 
 # -----------------------------------------------------------------------------
-# CHAT HISTORY
+# CHAT HISTORY (unchanged)
 # -----------------------------------------------------------------------------
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = InMemoryChatMessageHistory()
@@ -159,11 +119,11 @@ conversational_chain = RunnableWithMessageHistory(
     get_session_history,
     input_messages_key="input",
     history_messages_key="chat_history",
-    output_messages_key="answer"
+    output_messages_key="answer",
 )
 
 # -----------------------------------------------------------------------------
-# CHAT UI
+# CHAT UI (unchanged)
 # -----------------------------------------------------------------------------
 for msg in st.session_state.chat_history.messages:
     if isinstance(msg, HumanMessage):
@@ -187,18 +147,15 @@ if user_input:
             st.chat_message("assistant").write(answer)
 
         except Exception as e:
-            st.error(str(e))
+            st.error(f"Error: {e}")
 
 # -----------------------------------------------------------------------------
-# SIDEBAR
+# SIDEBAR (unchanged)
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("ℹ️ About")
-    st.write(
-        "This chatbot uses Retrieval-Augmented Generation (RAG) "
-        "to answer questions strictly from NHIF PDF documents."
-    )
-
+    st.write("This chatbot answers questions strictly from NHIF PDF documents using RAG.")
+    
     if st.button("🧹 Clear chat"):
         st.session_state.chat_history.clear()
         st.rerun()
