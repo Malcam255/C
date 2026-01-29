@@ -1,76 +1,175 @@
 import streamlit as st
+import os
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
+
+# ✅ CLOUD-COMPATIBLE (NO GPT4All, NO Ollama)
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_openai import ChatOpenAI
+from langchain_community.llms import HuggingFacePipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import torch
+
 from langchain_classic.chains.history_aware_retriever import create_history_aware_retriever
 from langchain_classic.chains.retrieval import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 
+# -----------------------------------------------------------------------------
+# STREAMLIT CONFIG
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="NHIF RAG Chatbot", page_icon="🤖", layout="wide")
+
 st.title("🤖 NHIF RAG Chatbot")
 st.caption("Ask questions about NHIF services, coverage, benefits, and claims")
 
-PDF_PATH = "nhif.pdf"
+# -----------------------------------------------------------------------------
+# PATHS - CLOUD READY
+# -----------------------------------------------------------------------------
+PDF_PATH = "nhif.pdf"  # Put PDF in repo root
 PERSIST_DIR = "./nhif_chroma_db"
 
-@st.cache_resource
+# -----------------------------------------------------------------------------
+# LOAD & CACHE EVERYTHING
+# -----------------------------------------------------------------------------
+@st.cache_resource(show_spinner=True)
 def load_rag_chain():
+    # Load PDF from repo
     loader = PyPDFLoader(PDF_PATH)
-    docs = loader.load()
-    texts = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=100).split_documents(docs)
+    documents = loader.load()
+
+    # Split text
+    splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=100)
+    texts = splitter.split_documents(documents)
+
+    # ✅ CLOUD EMBEDDINGS
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+
+    vectorstore = Chroma.from_documents(
+        texts,
+        embeddings,
+        persist_directory=PERSIST_DIR
+    )
+
+    retriever = vectorstore.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"score_threshold": 0.2, "k": 4}
+    )
+
+    # ✅ CLOUD LLM - Pure Python, no server needed
+    model_id = "microsoft/DialoGPT-medium"  # Small, fast, works on CPU
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id)
     
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vectorstore = Chroma.from_documents(texts, embeddings, persist_directory=PERSIST_DIR)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    pipe = pipeline(
+        "text-generation", 
+        model=model, 
+        tokenizer=tokenizer,
+        max_new_tokens=150,
+        temperature=0.1,
+        do_sample=True
+    )
     
-    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
-    
-    contextualize_q = ChatPromptTemplate.from_messages([
-        ("system", "Given chat history and question, create standalone question."), 
-        MessagesPlaceholder("chat_history"), ("human", "{input}")
+    llm = HuggingFacePipeline(pipeline=pipe)
+
+    # Question contextualizer
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            """Given a chat history and the latest user question,
+create a standalone question that incorporates context from the chat history."""
+        ),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
     ])
-    
+
+    # Answer prompt
     answer_prompt = ChatPromptTemplate.from_template("""
-You are NHIF expert. Use ONLY this context:
+You are an NHIF expert assistant. Use ONLY the context below.
+
+CONTEXT:
 {context}
-Question: {input}
-Answer only from context or say "No info in NHIF docs."
+
+QUESTION: {input}
+
+RULES:
+- Answer only from NHIF context
+- If missing, say: "I don't have that information in the NHIF documents."
+- Be concise and factual
+
+ANSWER:
 """)
-    
-    retriever_chain = create_history_aware_retriever(llm, retriever, contextualize_q)
+
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, contextualize_q_prompt
+    )
+
     qa_chain = create_stuff_documents_chain(llm, answer_prompt)
-    rag_chain = create_retrieval_chain(retriever_chain, qa_chain)
+    rag_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
+
     return rag_chain
 
 rag_chain = load_rag_chain()
 
+# -----------------------------------------------------------------------------
+# CHAT HISTORY (unchanged)
+# -----------------------------------------------------------------------------
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = InMemoryChatMessageHistory()
-    
-store = {"nhif": st.session_state.chat_history}
-def get_session_history(session_id): return store[session_id]
 
-chain = RunnableWithMessageHistory(
-    rag_chain, get_session_history, input_messages_key="input", 
-    history_messages_key="chat_history", output_messages_key="answer"
+store = {"nhif": st.session_state.chat_history}
+
+def get_session_history(session_id: str):
+    return store[session_id]
+
+conversational_chain = RunnableWithMessageHistory(
+    rag_chain,
+    get_session_history,
+    input_messages_key="input",
+    history_messages_key="chat_history",
+    output_messages_key="answer",
 )
 
+# -----------------------------------------------------------------------------
+# CHAT UI (unchanged)
+# -----------------------------------------------------------------------------
 for msg in st.session_state.chat_history.messages:
-    st.chat_message("user" if isinstance(msg, HumanMessage) else "assistant").write(msg.content)
+    if isinstance(msg, HumanMessage):
+        st.chat_message("user").write(msg.content)
+    elif isinstance(msg, AIMessage):
+        st.chat_message("assistant").write(msg.content)
 
-if user_input := st.chat_input("Ask about NHIF..."):
+user_input = st.chat_input("Ask a question about NHIF...")
+
+if user_input:
     st.chat_message("user").write(user_input)
-    with st.spinner("Thinking..."):
-        result = chain.invoke({"input": user_input}, config={"configurable": {"session_id": "nhif"}})
-        st.chat_message("assistant").write(result["answer"])
 
+    with st.spinner("Searching NHIF documents..."):
+        try:
+            result = conversational_chain.invoke(
+                {"input": user_input},
+                config={"configurable": {"session_id": "nhif"}}
+            )
+
+            answer = result["answer"]
+            st.chat_message("assistant").write(answer)
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+# -----------------------------------------------------------------------------
+# SIDEBAR (unchanged)
+# -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("ℹ️ About")
-    if st.button("🧹 Clear"): st.session_state.chat_history.clear(); st.rerun()
+    st.write("This chatbot answers questions strictly from NHIF PDF documents using RAG.")
+    
+    if st.button("🧹 Clear chat"):
+        st.session_state.chat_history.clear()
+        st.rerun()
