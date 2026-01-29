@@ -1,5 +1,4 @@
 import streamlit as st
-import os
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -7,13 +6,11 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
-# ✅ CLOUD-COMPATIBLE (NO GPT4All, NO Ollama)
+# ✅ CLOUD COMPATIBLE - NO GPT4All
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.llms import HuggingFacePipeline
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-import torch
+from langchain_openai import ChatOpenAI
 
 from langchain_classic.chains.history_aware_retriever import create_history_aware_retriever
 from langchain_classic.chains.retrieval import create_retrieval_chain
@@ -28,33 +25,32 @@ st.title("🤖 NHIF RAG Chatbot")
 st.caption("Ask questions about NHIF services, coverage, benefits, and claims")
 
 # -----------------------------------------------------------------------------
-# PATHS - CLOUD READY
+# PATHS
 # -----------------------------------------------------------------------------
-PDF_PATH = "nhif.pdf"  # Put PDF in repo root
+PDF_PATH = "nhif.pdf"
 PERSIST_DIR = "./nhif_chroma_db"
 
 # -----------------------------------------------------------------------------
-# LOAD & CACHE EVERYTHING
+# LOAD RAG CHAIN (CACHED)
 # -----------------------------------------------------------------------------
-@st.cache_resource(show_spinner=True)
+@st.cache_resource(show_spinner="Loading NHIF documents...")
 def load_rag_chain():
-    # Load PDF from repo
+    # Load PDF
     loader = PyPDFLoader(PDF_PATH)
     documents = loader.load()
 
-    # Split text
+    # Split documents
     splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=100)
     texts = splitter.split_documents(documents)
 
-    # ✅ CLOUD EMBEDDINGS
+    # ✅ HUGGINGFACE EMBEDDINGS (CLOUD SAFE)
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
+    # Create Chroma vectorstore
     vectorstore = Chroma.from_documents(
-        texts,
-        embeddings,
-        persist_directory=PERSIST_DIR
+        texts, embeddings, persist_directory=PERSIST_DIR
     )
 
     retriever = vectorstore.as_retriever(
@@ -62,34 +58,24 @@ def load_rag_chain():
         search_kwargs={"score_threshold": 0.2, "k": 4}
     )
 
-    # ✅ CLOUD LLM - Pure Python, no server needed
-    model_id = "microsoft/DialoGPT-medium"  # Small, fast, works on CPU
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id)
-    
-    pipe = pipeline(
-        "text-generation", 
-        model=model, 
-        tokenizer=tokenizer,
-        max_new_tokens=150,
-        temperature=0.1,
-        do_sample=True
+    # ✅ OPENAI LLM (put API key in Streamlit Secrets)
+    llm = ChatOpenAI(
+        model="gpt-3.5-turbo",
+        temperature=0
     )
-    
-    llm = HuggingFacePipeline(pipeline=pipe)
 
-    # Question contextualizer
+    # Contextualize question prompt
     contextualize_q_prompt = ChatPromptTemplate.from_messages([
         (
             "system",
-            """Given a chat history and the latest user question,
+            """Given a chat history and the latest user question, 
 create a standalone question that incorporates context from the chat history."""
         ),
         MessagesPlaceholder("chat_history"),
         ("human", "{input}")
     ])
 
-    # Answer prompt
+    # Answer synthesis prompt
     answer_prompt = ChatPromptTemplate.from_template("""
 You are an NHIF expert assistant. Use ONLY the context below.
 
@@ -99,26 +85,27 @@ CONTEXT:
 QUESTION: {input}
 
 RULES:
-- Answer only from NHIF context
-- If missing, say: "I don't have that information in the NHIF documents."
-- Be concise and factual
+- Answer only from NHIF context provided above
+- If information is missing, say: "I don't have that information in the NHIF documents."
+- Be concise, factual, and professional
 
 ANSWER:
 """)
 
+    # Create RAG chain
     history_aware_retriever = create_history_aware_retriever(
         llm, retriever, contextualize_q_prompt
     )
-
     qa_chain = create_stuff_documents_chain(llm, answer_prompt)
     rag_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
 
     return rag_chain
 
+# Load chain
 rag_chain = load_rag_chain()
 
 # -----------------------------------------------------------------------------
-# CHAT HISTORY (unchanged)
+# SESSION HISTORY
 # -----------------------------------------------------------------------------
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = InMemoryChatMessageHistory()
@@ -137,7 +124,7 @@ conversational_chain = RunnableWithMessageHistory(
 )
 
 # -----------------------------------------------------------------------------
-# CHAT UI (unchanged)
+# CHAT UI
 # -----------------------------------------------------------------------------
 for msg in st.session_state.chat_history.messages:
     if isinstance(msg, HumanMessage):
@@ -156,20 +143,18 @@ if user_input:
                 {"input": user_input},
                 config={"configurable": {"session_id": "nhif"}}
             )
-
-            answer = result["answer"]
-            st.chat_message("assistant").write(answer)
-
+            st.chat_message("assistant").write(result["answer"])
         except Exception as e:
             st.error(f"Error: {e}")
 
 # -----------------------------------------------------------------------------
-# SIDEBAR (unchanged)
+# SIDEBAR
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("ℹ️ About")
-    st.write("This chatbot answers questions strictly from NHIF PDF documents using RAG.")
+    st.write("**NHIF RAG Chatbot** answers questions strictly from NHIF PDF documents.")
+    st.write("**Powered by:** HuggingFace Embeddings + OpenAI GPT-3.5")
     
-    if st.button("🧹 Clear chat"):
+    if st.button("🧹 Clear Chat"):
         st.session_state.chat_history.clear()
         st.rerun()
