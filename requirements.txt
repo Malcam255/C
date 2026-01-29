@@ -4,7 +4,8 @@ langchain-huggingface
 langchain-text-splitters
 langchain-core
 sentence-transformers
-torch
 chromadb
 pypdf
-ollama
+transformers
+torch
+accelerate
