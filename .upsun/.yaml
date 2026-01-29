@@ -1,0 +1,15 @@
+name: nhif-chatbot
+
+type: python:3.11
+
+build:
+  flavor: pip
+
+hooks:
+  build: |
+    pip install --upgrade pip
+    pip install -r requirements.txt
+
+web:
+  commands:
+    start: streamlit run NH.py --server.port $PORT --server.address 0.0.0.0
