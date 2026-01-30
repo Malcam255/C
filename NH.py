@@ -33,7 +33,7 @@ st.caption("Ask questions about NHIF services, benefits, claims, and coverage")
 # ============================================================
 PDF_PATH = "nhif.pdf"   # put pdf in same folder
 VECTOR_DB_DIR = "./nhif_chroma_db"
-MODEL_PATH = r"C:\Users\Mekzedeck\AppData\Local\nomic.ai\GPT4All\Llama-3.2-3B-Instruct-Q4_0.gguf"
+MODEL_PATH = r"C:\Users\Mekzedeck\AppData\Local\nomic.ai\GPT4All\Llama-3.2-1B-Instruct-Q4_0.gguf"
 
 # ============================================================
 # LOAD & CACHE RESOURCES
