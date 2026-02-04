@@ -1,4 +1,8 @@
+# app.py
+
 import os
+import time
+import logging
 import streamlit as st
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -15,6 +19,14 @@ from langchain_classic.chains.history_aware_retriever import create_history_awar
 from langchain_classic.chains.retrieval import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 
+# ============================================================
+# LOGGING SETUP
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NHIF-RAG")
 
 # ============================================================
 # STREAMLIT CONFIG
@@ -28,50 +40,85 @@ st.set_page_config(
 st.title("🤖 NHIF RAG Chatbot")
 st.caption("Ask questions about NHIF services, benefits, claims, and coverage")
 
+# Optional: Show logs in UI
+log_box = st.expander("📊 System logs", expanded=True)
+log_area = log_box.empty()
+
+def ui_log(msg):
+    logger.info(msg)
+    log_area.markdown(f"`{msg}`")
+
 # ============================================================
-# PATHS (EDIT IF DEPLOYING)
+# PATHS
 # ============================================================
-PDF_PATH = "nhif.pdf"   # put pdf in same folder
+PDF_PATH = "nhif.pdf"
 VECTOR_DB_DIR = "./nhif_chroma_db"
 MODEL_PATH = r"C:\Users\Mekzedeck\AppData\Local\nomic.ai\GPT4All\Llama-3.2-1B-Instruct-Q4_0.gguf"
 
 # ============================================================
-# LOAD & CACHE RESOURCES
+# VECTORSTORE (LAZY + LOGGED)
 # ============================================================
-@st.cache_resource(show_spinner=True)
-def load_rag_pipeline():
+@st.cache_resource(show_spinner=False)
+def load_vectorstore():
 
-    loader = PyPDFLoader(PDF_PATH)
-    documents = loader.load()
-
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=600,
-        chunk_overlap=100
-    )
-    texts = text_splitter.split_documents(documents)
-
+    start_total = time.perf_counter()
     embeddings = GPT4AllEmbeddings()
 
+    if os.path.exists(VECTOR_DB_DIR):
+        start = time.perf_counter()
+        vs = Chroma(
+            persist_directory=VECTOR_DB_DIR,
+            embedding_function=embeddings
+        )
+        ui_log(f"[VECTORSTORE] Loaded from disk in {time.perf_counter() - start:.2f}s")
+        return vs
+
+    ui_log("[STARTUP] Vectorstore not found – building embeddings")
+
+    start = time.perf_counter()
+    loader = PyPDFLoader(PDF_PATH)
+    docs = loader.load()
+    ui_log(f"[PDF] Loaded {len(docs)} pages in {time.perf_counter() - start:.2f}s")
+
+    start = time.perf_counter()
+    splitter = RecursiveCharacterTextSplitter(600, 100)
+    chunks = splitter.split_documents(docs)
+    ui_log(f"[CHUNKS] Created {len(chunks)} chunks in {time.perf_counter() - start:.2f}s")
+
+    start = time.perf_counter()
     vectorstore = Chroma.from_documents(
-        texts,
+        chunks,
         embeddings,
         persist_directory=VECTOR_DB_DIR
     )
+    ui_log(f"[EMBEDDINGS] Built + saved in {time.perf_counter() - start:.2f}s")
+
+    ui_log(f"[TOTAL] Index built in {time.perf_counter() - start_total:.2f}s")
+    return vectorstore
+
+# ============================================================
+# RAG PIPELINE 
+# ============================================================
+def load_rag_pipeline():
+
+    start_total = time.perf_counter()
+
+    vectorstore = load_vectorstore()
 
     retriever = vectorstore.as_retriever(
         search_type="similarity_score_threshold",
         search_kwargs={"score_threshold": 0.1, "k": 4}
     )
 
+    start = time.perf_counter()
     llm = GPT4All(
         model=MODEL_PATH,
         n_threads=8
     )
+    ui_log(f"[LLM] Model loaded in {time.perf_counter() - start:.2f}s")
 
     contextualize_q_prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "Given a chat history and the latest user question, "
-         "create a standalone question that incorporates context."),
+        ("system", "Given a chat history and the latest user question, create a standalone question."),
         MessagesPlaceholder("chat_history"),
         ("human", "{input}")
     ])
@@ -84,11 +131,6 @@ CONTEXT:
 
 QUESTION: {input}
 
-Rules:
-- Answer ONLY using the NHIF context
-- If missing info say: "I don't have that information in the NHIF documents."
-- Be concise and accurate
-
 ANSWER:
 """)
 
@@ -96,23 +138,19 @@ ANSWER:
         llm, retriever, contextualize_q_prompt
     )
 
-    question_answer_chain = create_stuff_documents_chain(
-        llm, answer_prompt
-    )
+    qa_chain = create_stuff_documents_chain(llm, answer_prompt)
+    rag_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
 
-    rag_chain = create_retrieval_chain(
-        history_aware_retriever,
-        question_answer_chain
-    )
+    ui_log(f"[TOTAL] RAG pipeline ready in {time.perf_counter() - start_total:.2f}s")
 
     store = {}
 
-    def get_session_history(session_id: str):
+    def get_session_history(session_id):
         if session_id not in store:
             store[session_id] = InMemoryChatMessageHistory()
         return store[session_id]
 
-    conversational_chain = RunnableWithMessageHistory(
+    return RunnableWithMessageHistory(
         rag_chain,
         get_session_history,
         input_messages_key="input",
@@ -120,17 +158,18 @@ ANSWER:
         output_messages_key="answer"
     )
 
-    return conversational_chain
+# ============================================================
+# SESSION STATE
+# ============================================================
+if "rag_chain" not in st.session_state:
+    st.session_state.rag_chain = None
 
-
-rag_chain = load_rag_pipeline()
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
 # ============================================================
 # CHAT UI
 # ============================================================
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -138,26 +177,23 @@ for msg in st.session_state.messages:
 user_input = st.chat_input("Ask a question about NHIF...")
 
 if user_input:
-    st.session_state.messages.append(
-        {"role": "user", "content": user_input}
-    )
 
-    with st.chat_message("user"):
-        st.markdown(user_input)
+    if st.session_state.rag_chain is None:
+        with st.spinner("⚙️ Initializing NHIF AI assistant..."):
+            st.session_state.rag_chain = load_rag_pipeline()
+
+    rag_chain = st.session_state.rag_chain
+
+    st.session_state.messages.append({"role": "user", "content": user_input})
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching NHIF documents..."):
-            try:
-                result = rag_chain.invoke(
-                    {"input": user_input},
-                    config={"configurable": {"session_id": "nhif_streamlit"}}
-                )
-                answer = result["answer"]
-            except Exception as e:
-                answer = f"❌ Error: {str(e)}"
+        with st.spinner("🔎 Searching NHIF documents..."):
+            result = rag_chain.invoke(
+                {"input": user_input},
+                config={"configurable": {"session_id": "nhif_streamlit"}}
+            )
+            answer = result["answer"]
 
         st.markdown(answer)
 
-    st.session_state.messages.append(
-        {"role": "assistant", "content": answer}
-    )
+    st.session_state.messages.append({"role": "assistant", "content": answer})
